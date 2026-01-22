@@ -40,7 +40,6 @@ struct image_definition {
 class GUIEngine;
 class RenderingEngine;
 class MainMenuScripting;
-class IWritableShaderSource;
 struct MainMenuData;
 
 /******************************************************************************/
@@ -62,6 +61,11 @@ public:
 	 * @param fields map containing formspec field elements currently active
 	 */
 	void gotText(const StringMap &fields);
+
+	/**
+	 * Request a screenshot from the main menu
+	 */
+	void requestScreenshot();
 
 private:
 	/** target to transmit data to */
@@ -148,6 +152,14 @@ public:
 	}
 
 	/**
+	 * Request taking a screenshot on the next frame
+	 */
+	void requestScreenshot()
+	{
+		m_take_screenshot = true;
+	}
+
+	/**
 	 * Get translations for content
 	 *
 	 * Only loads a single textdomain from the path, as specified by `domain`,
@@ -199,6 +211,9 @@ private:
 
 	/** variable used to abort menu and return back to main game handling */
 	bool                                  m_startgame = false;
+
+	/** flag to take a screenshot on next frame */
+	bool                                  m_take_screenshot = false;
 
 	/** scripting interface */
 	std::unique_ptr<MainMenuScripting>    m_script;
@@ -263,6 +278,9 @@ private:
 
 	/** is drawing of clouds enabled atm */
 	bool m_clouds_enabled = true;
+
+	void setMenuCloudsColor(video::SColor color);
+	void setMenuSkyColor(video::SColor color);
 
 	static void fullscreenChangedCallback(const std::string &name, void *data);
 };
