@@ -42,12 +42,17 @@
 #include "util/string.h"
 #include "version.h"
 
-// Modding
+// CPCSM
 #include "content/mod_configuration.h"
 #include "content/mods.h"
 #include "modchannels.h"
 #include "script/common/c_types.h" // LuaError
 #include "script/scripting_client.h"
+
+// SSCSM
+#include "client/mod_vfs.h"
+#include "script/sscsm/sscsm_controller.h"
+#include "script/sscsm/sscsm_events.h"
 
 // Network
 #include "network/clientopcodes.h"
@@ -62,6 +67,8 @@
 
 #include <IAnimatedMesh.h>
 #include <IFileSystem.h>
+#include <IReadFile.h>
+#include <IMeshCache.h>
 #include <json/json.h>
 
 #include <iostream>
@@ -93,6 +100,25 @@ void PacketCounter::print(std::ostream &o) const
 		o << "cmd " << it.first << " (" << name << ") count "
 			<< it.second << std::endl;
 	}
+}
+
+[[maybe_unused]]
+static void enrich_exception(BaseException &e, const NetworkPacket &pkt, bool include_pos)
+{
+	const u16 cmd = pkt.getCommand();
+	std::ostringstream oss;
+	if (cmd < TOCLIENT_NUM_MSG_TYPES)
+		oss << " name=" << toClientCommandTable[cmd].name;
+
+	if (include_pos) {
+		// (not necessary for PacketError: already in e.what())
+
+		oss << " cmd=" << cmd
+			<< " offset=" << pkt.getOffset()
+			<< " size=" << pkt.getSize();
+	}
+
+	e.append(" @").append(oss.str());
 }
 
 /*
@@ -150,6 +176,32 @@ Client::Client(
 
 	m_cache_save_interval = g_settings->getU16("server_map_save_interval");
 	m_mesh_grid = { g_settings->getU16("client_mesh_chunk") };
+
+	m_sscsm_controller = SSCSMController::create();
+
+	{
+		auto event1 = std::make_unique<SSCSMEventUpdateVFSFiles>();
+
+		ModVFS tmp_mod_vfs;
+		// FIXME: only read files that are relevant to sscsm, and compute sha2 digests
+		tmp_mod_vfs.scanModIntoMemory("*client_builtin*", getBuiltinLuaPath());
+
+		for (auto &p : tmp_mod_vfs.m_vfs) {
+			event1->files.emplace_back(p.first, std::move(p.second));
+		}
+
+		m_sscsm_controller->runEvent(this, std::move(event1));
+
+		// load client builtin immediately
+		auto event2 = std::make_unique<SSCSMEventLoadMods>();
+		event2->mods.emplace_back("*client_builtin*", "*client_builtin*:init.lua");
+		m_sscsm_controller->runEvent(this, std::move(event2));
+	}
+
+	//FIXME: network packets
+	//FIXME: check that *client_builtin* is not overridden
+	// The sscsm_test0 preview mod is loaded from loadSSCSM(),
+	// once itemdefs/nodedefs actually exist to populate core.registered_*.
 }
 
 void Client::migrateModStorage()
@@ -197,12 +249,14 @@ void Client::loadMods()
 		return;
 	}
 
+	m_mod_vfs = std::make_unique<ModVFS>();
+
 	m_script = new ClientScripting(this);
 	m_env.setScript(m_script);
 	m_script->setEnv(&m_env);
 
 	// Load builtin
-	scanModIntoMemory(BUILTIN_MOD_NAME, getBuiltinLuaPath());
+	m_mod_vfs->scanModIntoMemory(BUILTIN_MOD_NAME, getBuiltinLuaPath());
 	m_script->loadModFromMemory(BUILTIN_MOD_NAME);
 	m_script->checkSetByBuiltin();
 
@@ -241,7 +295,7 @@ void Client::loadMods()
 	// Load "mod" scripts
 	for (const ModSpec &mod : m_mods) {
 		mod.checkAndLog();
-		scanModIntoMemory(mod.name, mod.path);
+		m_mod_vfs->scanModIntoMemory(mod.name, mod.path);
 	}
 
 	// Run them
@@ -261,35 +315,6 @@ void Client::loadMods()
 		m_script->on_camera_ready(m_camera);
 	if (m_minimap)
 		m_script->on_minimap_ready(m_minimap.get());
-}
-
-void Client::scanModSubfolder(const std::string &mod_name, const std::string &mod_path,
-			std::string mod_subpath)
-{
-	std::string full_path = mod_path + DIR_DELIM + mod_subpath;
-	std::vector<fs::DirListNode> mod = fs::GetDirListing(full_path);
-	for (const fs::DirListNode &j : mod) {
-		if (j.name[0] == '.')
-			continue;
-
-		if (j.dir) {
-			scanModSubfolder(mod_name, mod_path, mod_subpath + j.name + DIR_DELIM);
-			continue;
-		}
-		std::replace(mod_subpath.begin(), mod_subpath.end(), DIR_DELIM_CHAR, '/');
-
-		std::string real_path = full_path + j.name;
-		std::string vfs_path = mod_name + ":" + mod_subpath + j.name;
-		infostream << "Client::scanModSubfolder(): Loading \"" << real_path
-				<< "\" as \"" << vfs_path << "\"." << std::endl;
-
-		std::string contents;
-		if (!fs::ReadFile(real_path, contents, true)) {
-			continue;
-		}
-
-		m_mod_vfs.emplace(vfs_path, contents);
-	}
 }
 
 const std::string &Client::getBuiltinLuaPath()
@@ -348,14 +373,7 @@ Client::~Client()
 
 	m_mesh_update_manager->stop();
 	m_mesh_update_manager->wait();
-
-	MeshUpdateResult r;
-	while (m_mesh_update_manager->getNextResult(r)) {
-		for (auto block : r.map_blocks)
-			if (block)
-				block->refDrop();
-		delete r.mesh;
-	}
+	m_mesh_update_manager->clearAllQueues(true);
 
 	// Delete detached inventories
 	for (auto &m_detached_inventorie : m_detached_inventories) {
@@ -537,6 +555,12 @@ void Client::step(float dtime)
 	*/
 	LocalPlayer *player = m_env.getLocalPlayer();
 
+	{
+		auto event = std::make_unique<SSCSMEventOnStep>();
+		event->dtime = dtime;
+		m_sscsm_controller->runEvent(this, std::move(event));
+	}
+
 	// Step environment (also handles player controls)
 	m_env.step(dtime);
 	m_sound->step(dtime);
@@ -625,17 +649,13 @@ void Client::step(float dtime)
 					if (minimap_mapblocks.empty())
 						do_mapper_update = false;
 
-					if (r.mesh->isEmpty()) {
-						delete r.mesh;
-					} else {
+					if (!r.mesh->isEmpty()) {
 						// Replace with the new mesh
-						block->mesh = r.mesh;
+						block->mesh = r.mesh.release();
 						if (r.urgent)
 							force_update_shadows = true;
 					}
 				}
-			} else {
-				delete r.mesh;
 			}
 
 			if (m_minimap && do_mapper_update) {
@@ -693,23 +713,25 @@ void Client::step(float dtime)
 		std::vector<u32> done;
 		for (auto it = m_pending_media_downloads.begin();
 				it != m_pending_media_downloads.end();) {
-			assert(it->second->isStarted());
-			it->second->step(this);
-			if (it->second->isDone()) {
-				done.emplace_back(it->first);
+			assert(it->d->isStarted());
+			it->d->step(this);
+			if (it->d->isDone()) {
+				done.insert(done.end(), it->tokens.begin(), it->tokens.end());
 
 				it = m_pending_media_downloads.erase(it);
 			} else {
 				it++;
 			}
-
-			if (done.size() == 255) { // maximum in one packet
-				sendHaveMedia(done);
-				done.clear();
-			}
 		}
-		if (!done.empty())
-			sendHaveMedia(done);
+		while (!done.empty()) {
+			// this looks stupid, but is a simple and correct way to chunk them
+			std::vector<u32> part;
+			while (!done.empty() && part.size() < 255) {
+				part.push_back(done.back());
+				done.pop_back();
+			}
+			sendHaveMedia(part);
+		}
 	}
 
 	/*
@@ -797,6 +819,8 @@ bool Client::loadMedia(const std::string &data, const std::string &filename,
 	bool from_media_push)
 {
 	std::string name;
+
+	// Consider updating LuantiDocumentsProvider.java if new file types are added
 
 	const char *image_ext[] = {
 		".png", ".jpg", ".tga",
@@ -979,24 +1003,18 @@ void Client::ReceiveAll()
 			if (!m_con->TryReceive(&pkt))
 				break;
 			ProcessData(&pkt);
-#ifdef NDEBUG
-		} catch (SerializationError &e) {
-			// Add more information to find the bad packet
-			const u16 cmd = pkt.getCommand();
-			std::ostringstream oss;
-			oss << e.what()
-				<< "\n @ command=" << cmd << " size=" << pkt.getSize();
-
-			if (cmd < TOCLIENT_NUM_MSG_TYPES) {
-				auto def = toClientCommandTable[pkt.getCommand()];
-				oss << " name=" << def.name;
-			}
-			throw SerializationError(oss.str());
-#endif
 		} catch (const con::InvalidIncomingDataException &e) {
 			infostream << "Client::ReceiveAll(): "
 					"InvalidIncomingDataException: what()="
 					 << e.what() << std::endl;
+#ifdef NDEBUG
+		} catch (SerializationError &e) {
+			enrich_exception(e, pkt, true);
+			throw;
+		} catch (PacketError &e) {
+			enrich_exception(e, pkt, false);
+			throw;
+#endif
 		}
 	}
 }
@@ -1610,6 +1628,13 @@ bool Client::updateWieldedItem()
 	return true;
 }
 
+bool Client::consumeSkipNextWieldAnimation()
+{
+	bool v = m_skip_next_wield_animation;
+	m_skip_next_wield_animation = false;
+	return v;
+}
+
 scene::ISceneManager* Client::getSceneManager()
 {
 	return m_rendering_engine->get_scene_manager();
@@ -1813,12 +1838,14 @@ const Address Client::getServerAddress()
 	return m_con ? m_con->GetPeerAddress(PEER_ID_SERVER) : Address();
 }
 
-float Client::mediaReceiveProgress()
+bool Client::mediaReceiveProgress(s32 &received, s32 &total, size_t &received_size) const
 {
-	if (m_media_downloader)
-		return m_media_downloader->getProgress();
+	if (m_media_downloader && m_media_downloader->isStarted()) {
+		m_media_downloader->getProgress(received, total, received_size);
+		return true;
+	}
 
-	return 1.0f; // downloader only exists when not yet done
+	return false;
 }
 
 void Client::drawLoadScreen(const std::wstring &text, float dtime, int percent)
@@ -1900,6 +1927,10 @@ void Client::afterContentReceived()
 	tu_args.text_base = wstrgettext("Initializing nodes");
 	NodeVisuals::fillNodeVisuals(m_nodedef, this, &tu_args);
 
+	// Runs after fillNodeVisuals(), which is where ContentFeatures::visuals and thus
+	// minimap_color, and palette - the two values we care for in SSCSM, get populated
+	m_sscsm_controller->runEvent(this, std::make_unique<SSCSMEventAfterContentReceived>());
+
 	// Start mesh update thread after setting up content definitions
 	infostream<<"- Starting mesh update thread"<<std::endl;
 	m_mesh_update_manager->start();
@@ -1912,6 +1943,48 @@ void Client::afterContentReceived()
 
 	m_rendering_engine->draw_load_screen(wstrgettext("Done!"), guienv, m_tsrc, 0, 100);
 	infostream<<"Client::afterContentReceived() done"<<std::endl;
+}
+
+void Client::loadSSCSM()
+{
+	std::string enable_sscsm = g_settings->get("enable_sscsm");
+	bool sscsm_enabled = enable_sscsm == "singleplayer"; //FIXME: enum
+	if (!sscsm_enabled)
+		return;
+
+	auto event1 = std::make_unique<SSCSMEventUpdateVFSFiles>();
+
+	// some simple test code
+	event1->files.emplace_back("sscsm_test0:init.lua",
+			R"=+=(
+print("sscsm_test0: loading")
+
+--print(dump(_G))
+--print(debug.traceback())
+
+do
+	local pos = vector.zero()
+	local function print_nodes()
+		print(string.format("node at %s: %s", pos, dump(core.get_node_or_nil(pos))))
+		pos = pos:offset(1, 0, 0)
+		core.after(1, print_nodes)
+	end
+	core.after(0, print_nodes)
+end
+
+do
+	local n = 0
+	for _ in pairs(core.registered_nodes) do n = n + 1 end
+	print("sscsm_test0: registered_nodes count: " .. n)
+end
+print("sscsm_test0: air def: " .. dump(core.registered_nodes["air"]))
+				)=+=");
+
+	m_sscsm_controller->runEvent(this, std::move(event1));
+
+	auto event2 = std::make_unique<SSCSMEventLoadMods>();
+	event2->mods.emplace_back("sscsm_test0", "sscsm_test0:init.lua");
+	m_sscsm_controller->runEvent(this, std::move(event2));
 }
 
 float Client::getRTT()
@@ -1989,47 +2062,35 @@ ParticleManager* Client::getParticleManager()
 	return m_particle_manager.get();
 }
 
-scene::IAnimatedMesh* Client::getMesh(const std::string &filename, bool cache)
+scene::IAnimatedMesh *Client::getMesh(const std::string &filename, bool *is_shared)
 {
-	StringMap::const_iterator it = m_mesh_data.find(filename);
-	if (it == m_mesh_data.end()) {
-		errorstream << "Client::getMesh(): Mesh not found: \"" << filename
-			<< "\"" << std::endl;
-		return NULL;
-	}
-	const std::string &data    = it->second;
+	auto it = m_mesh_data.find(filename);
+	if (it == m_mesh_data.end())
+		return nullptr;
 
-	// Create the mesh, remove it from cache and return it
-	// This allows unique vertex colors and other properties for each instance
+	if (is_shared)
+		*is_shared = true; // this is currently always the case
+
+	// Try getting it from cache explicitly
+	auto *sm = m_rendering_engine->get_scene_manager();
+	auto *mesh = sm->getMeshCache()->getMeshByName(filename.c_str());
+	if (mesh) {
+		mesh->grab();
+		return mesh;
+	}
+
+	// Load the mesh from file data
+	const std::string &data = it->second;
 	io::IReadFile *rfile = m_rendering_engine->get_filesystem()->createMemoryReadFile(
 			data.c_str(), data.size(), filename.c_str());
 	FATAL_ERROR_IF(!rfile, "Could not create/open RAM file");
 
-	scene::IAnimatedMesh *mesh = m_rendering_engine->get_scene_manager()->getMesh(rfile);
+	mesh = sm->getMesh(rfile);
 	rfile->drop();
 	if (!mesh)
 		return nullptr;
 	mesh->grab();
-	if (!cache)
-		m_rendering_engine->removeMesh(mesh);
 	return mesh;
-}
-
-const std::string* Client::getModFile(std::string filename)
-{
-	// strip dir delimiter from beginning of path
-	auto pos = filename.find_first_of(':');
-	if (pos == std::string::npos)
-		return nullptr;
-	pos++;
-	auto pos2 = filename.find_first_not_of('/', pos);
-	if (pos2 > pos)
-		filename.erase(pos, pos2 - pos);
-
-	StringMap::const_iterator it = m_mod_vfs.find(filename);
-	if (it == m_mod_vfs.end())
-		return nullptr;
-	return &it->second;
 }
 
 /*

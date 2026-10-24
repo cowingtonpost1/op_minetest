@@ -20,7 +20,8 @@ std::string ModConfiguration::getUnsatisfiedModsError() const
 	error << gettext("Some mods have unsatisfied dependencies:") << std::endl;
 
 	for (const ModSpec &mod : m_unsatisfied_mods) {
-		//~ Error when a mod is missing dependencies. Ex: "Mod Title is missing: mod1, mod2, mod3"
+		/* TRANSLATORS: Error when a mod is missing dependencies.
+		Example: "Mod Title is missing: mod1, mod2, mod3" */
 		error << " - " << fmtgettext("%s is missing:", mod.name.c_str());
 		for (const std::string &unsatisfied_depend : mod.unsatisfied_depends)
 			error << " " << unsatisfied_depend;
@@ -38,7 +39,7 @@ void ModConfiguration::addModsInPath(const std::string &path, const std::string 
 {
 	verbosestream << "Adding mods from path " << path << " virtual=\""
 		<< virtual_path << "\"" << std::endl;
-	addMods(flattenMods(getModsInPath(path, virtual_path)));
+	addMods(flattenMods(getModsInPath(path, virtual_path), true));
 }
 
 void ModConfiguration::addMods(const std::vector<ModSpec> &new_mods)
@@ -146,7 +147,9 @@ void ModConfiguration::addModsFromConfig(
 	 * and used in an error message later.
 	 */
 	for (const auto &modPath : modPaths) {
-		std::vector<ModSpec> addon_mods_in_path = flattenMods(getModsInPath(modPath.second, modPath.first));
+		std::vector<ModSpec> addon_mods_in_path =
+			flattenMods(getModsInPath(modPath.second, modPath.first), true);
+
 		for (const auto &mod : addon_mods_in_path) {
 			const auto &pair = load_mod_names.find(mod.name);
 			if (pair != load_mod_names.end()) {
