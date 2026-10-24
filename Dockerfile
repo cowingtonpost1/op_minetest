@@ -12,20 +12,10 @@ RUN apk add --no-cache git build-base cmake curl-dev zlib-dev zstd-dev \
 
 WORKDIR /usr/src/
 
-ADD https://github.com/jupp0r/prometheus-cpp.git?branch=master /usr/src/prometheus-cpp
 ADD https://github.com/libspatialindex/libspatialindex.git?branch=main /usr/src/libspatialindex
 ADD --keep-git-dir https://luajit.org/git/luajit.git?branch=${LUAJIT_VERSION} /usr/src/luajit
 
-RUN cd prometheus-cpp && \
-		cmake -B build \
-			-DCMAKE_INSTALL_PREFIX=/usr/local \
-			-DCMAKE_BUILD_TYPE=Release \
-			-DENABLE_TESTING=0 \
-			-GNinja && \
-		cmake --build build && \
-		cmake --install build && \
-		cd /usr/src/ && \
-	cd libspatialindex && \
+RUN cd libspatialindex && \
 		cmake -B build \
 			-DCMAKE_INSTALL_PREFIX=/usr/local && \
 		cmake --build build && \
